@@ -1,0 +1,99 @@
+# act workflow_dispatch --artifact-server-path ~/downloads
+name: Org Sync
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: '0 0 * * *'
+
+jobs:
+    sync-production:
+        name: Sync Production
+        runs-on: ubuntu-latest
+        environment: production
+
+        steps:
+            - name: Create env variables
+              run: echo "today=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+            - name: Check the current branch
+              if: github.ref_name != 'production' && github.event_name == 'workflow_dispatch'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  echo "::debug::Can only be run production branch"
+                  gh run cancel $GITHUB_RUN_ID
+
+            - name: Check out code
+              uses: actions/checkout@v3
+              with:
+                  ref: production
+
+            - name: Setup SFDX
+              uses: sfdx-actions/setup-sfdx@v1
+              with:
+                  sfdx-auth-url: ${{ secrets.FORCE_AUTH_URL }}
+
+            - name: Pull latest source
+              run: sfdx force:source:retrieve -x manifest/package.xml
+
+            - run: git config --global --add safe.directory .
+
+            - name: Check if there are changes
+              id: changes
+              run: |
+                  if [[ -z "$(git status --porcelain force-app)" ]];
+                  then
+                      echo "exist=0" >> $GITHUB_OUTPUT
+                  else
+                      echo "exist=1" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Check if PR exists
+              id: pr
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  prs=$(gh pr list \
+                      --repo "$GITHUB_REPOSITORY" \
+                      --json baseRefName,headRefName \
+                      --jq '
+                          map(select(.baseRefName == "main" and .headRefName == "production"))
+                          | length
+                      ')
+                  if ((prs > 0));
+                  then
+                    echo "::set-output name=exists::1"
+                  else
+                    echo "::set-output name=exists::0"
+                  fi
+
+            - name: Create pull request
+              if: steps.pr.outputs.exists == 0 && steps.changes.outputs.exist == 1
+              uses: peter-evans/create-pull-request@v4
+              with:
+                  commit-message: downstream sync - ${{ env.today }}
+                  committer: GitHub <noreply@github.com>
+                  author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
+                  branch: production
+                  base: main
+                  delete-branch: false
+                  draft: false
+                  title: 'Downstream sync - ${{ env.today }}'
+                  body: |
+                      Changes were found on the org.
+                      _This pull request was created automatically._
+                  labels: |
+                      automated pr
+                      production sync
+                  assignees: ${{ vars.DOWNSTREAM_SYNC_PR_REVIEWERS }}
+                  reviewers: ${{ vars.DOWNSTREAM_SYNC_PR_REVIEWERS }}
+
+            - name: Commit changes
+              if: steps.pr.outputs.exists == 1 && steps.changes.outputs.exist == 1
+              uses: actions-x/commit@v6
+              with:
+                  email: ${{ github.actor }}@users.noreply.github.com
+                  name: ${{ github.actor }}
+                  message: downstream sync - ${{ env.today }}
+                  branch: production
